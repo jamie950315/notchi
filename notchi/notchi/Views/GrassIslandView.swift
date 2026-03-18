@@ -156,14 +156,13 @@ private struct GrassSpriteView: View {
         guard state.bobAmplitude > 0 else { return 0 }
         return state.task == .working ? 1.5 : 1
     }
-    private let glowColor = Color(red: 0.4, green: 0.7, blue: 1.0)
 
     private var swayAmplitude: Double {
         (state.task == .sleeping || state.task == .compacting) ? 0 : state.swayAmplitude
     }
 
     private var isAnimatingMotion: Bool {
-        bobAmplitude > 0 || swayAmplitude > 0 || state.emotion == .sob
+        bobAmplitude > 0 || swayAmplitude > 0 || state.trembleAmplitude > 0 || state.scalePulse > 0
     }
 
     private var bobDuration: Double {
@@ -177,7 +176,36 @@ private struct GrassSpriteView: View {
         return sin(phase * .pi * 2) * swayAmplitude
     }
 
-    private static let sobTrembleAmplitude: CGFloat = 0.3
+    private func scalePulseValue(at date: Date) -> CGFloat {
+        guard state.scalePulse > 0 else { return 1.0 }
+        let t = date.timeIntervalSinceReferenceDate
+        let speed: Double = state.emotion == .excited ? 3.0 : 1.5
+        let phase = (t * speed).truncatingRemainder(dividingBy: 1.0)
+        return 1.0 + CGFloat(sin(phase * .pi * 2)) * state.scalePulse
+    }
+
+    private var emotionGlowColor: Color {
+        switch state.emotion {
+        case .excited:  return Color(red: 1.0, green: 0.85, blue: 0.0)
+        case .angry:    return Color(red: 1.0, green: 0.2, blue: 0.15)
+        case .love:     return Color(red: 1.0, green: 0.4, blue: 0.6)
+        case .happy:    return Color(red: 0.3, green: 0.9, blue: 0.4)
+        case .sad, .sob: return Color(red: 0.3, green: 0.4, blue: 0.8)
+        case .neutral:  return Color(red: 0.4, green: 0.7, blue: 1.0)
+        }
+    }
+
+    private var emotionGlowOpacity: Double {
+        switch state.emotion {
+        case .neutral: return 0
+        case .excited: return 0.6
+        case .angry:   return 0.5
+        case .love:    return 0.5
+        case .happy:   return 0.3
+        case .sad:     return 0.2
+        case .sob:     return 0.3
+        }
+    }
 
     var body: some View {
         TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !isAnimatingMotion)) { timeline in
@@ -189,10 +217,15 @@ private struct GrassSpriteView: View {
                 isAnimating: true
             )
             .frame(width: SpriteLayout.size, height: SpriteLayout.size)
+            .overlay {
+                EmotionParticlesView(emotion: state.emotion, size: SpriteLayout.size)
+            }
+            .scaleEffect(scalePulseValue(at: timeline.date))
             .background(alignment: .bottom) {
-                if glowOpacity > 0 {
+                let combinedGlow = max(glowOpacity, emotionGlowOpacity)
+                if combinedGlow > 0 {
                     Ellipse()
-                        .fill(glowColor.opacity(glowOpacity))
+                        .fill((glowOpacity > emotionGlowOpacity ? Color(red: 0.4, green: 0.7, blue: 1.0) : emotionGlowColor).opacity(combinedGlow))
                         .frame(width: SpriteLayout.size * 0.85, height: SpriteLayout.size * 0.25)
                         .blur(radius: 8)
                         .offset(y: 4)
@@ -200,7 +233,7 @@ private struct GrassSpriteView: View {
             }
             .rotationEffect(.degrees(swayDegrees(at: timeline.date)), anchor: .bottom)
             .offset(
-                x: SpriteLayout.xOffset(xPosition: xPosition, totalWidth: totalWidth) + trembleOffset(at: timeline.date, amplitude: state.emotion == .sob ? Self.sobTrembleAmplitude : 0),
+                x: SpriteLayout.xOffset(xPosition: xPosition, totalWidth: totalWidth) + trembleOffset(at: timeline.date, amplitude: state.trembleAmplitude),
                 y: yOffset + bobOffset(at: timeline.date, duration: bobDuration, amplitude: bobAmplitude)
             )
         }

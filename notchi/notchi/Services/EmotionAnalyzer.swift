@@ -3,11 +3,15 @@ import os.log
 
 private let logger = Logger(subsystem: "com.ruban.notchi", category: "EmotionAnalyzer")
 
-private struct HaikuResponse: Decodable {
-    let content: [ContentBlock]
+private struct ChatCompletionResponse: Decodable {
+    let choices: [Choice]
 
-    struct ContentBlock: Decodable {
-        let text: String?
+    struct Choice: Decodable {
+        let message: Message
+    }
+
+    struct Message: Decodable {
+        let content: String?
     }
 }
 
@@ -16,20 +20,35 @@ private struct EmotionResponse: Decodable {
     let intensity: Double
 }
 
+enum EmotionError: LocalizedError {
+    case httpError(Int, String)
+    case decodeFailed(String)
+    case emptyResponse
+
+    var errorDescription: String? {
+        switch self {
+        case .httpError(let code, _): return "HTTP \(code)"
+        case .decodeFailed: return "Invalid response format"
+        case .emptyResponse: return "Empty response"
+        }
+    }
+}
+
 @MainActor
 final class EmotionAnalyzer {
     static let shared = EmotionAnalyzer()
 
-    private static let apiURL = URL(string: "https://api.anthropic.com/v1/messages")!
-    private static let model = "claude-haiku-4-5-20251001"
-    private static let validEmotions: Set<String> = ["happy", "sad", "neutral"]
+    private static let validEmotions: Set<String> = ["happy", "sad", "neutral", "excited", "angry", "love"]
 
     private static let systemPrompt = """
         Classify the emotional tone of the user's message into exactly one emotion and an intensity score.
-        Emotions: happy, sad, neutral.
-        Happy: explicit praise ("great job", "thank you!"), gratitude, celebration, positive profanity ("LETS FUCKING GO").
-        Sad: frustration, anger, insults, complaints, feeling stuck, disappointment, negative profanity.
-        Neutral: instructions, requests, task descriptions, questions, enthusiasm about work, factual statements. Exclamation marks or urgency about a task do NOT make it happy — only genuine positive sentiment toward the AI or outcome does.
+        Emotions: happy, sad, neutral, excited, angry, love.
+        Happy: praise ("great job", "thank you!"), gratitude, satisfaction, positive feedback.
+        Excited: intense celebration, hype, breakthroughs, positive profanity ("LETS FUCKING GO", "HOLY SHIT IT WORKS"), amazement, can't-believe-it joy.
+        Love: affection toward the AI ("you're the best", "I love you claude", "marry me"), heartfelt appreciation, deep gratitude.
+        Sad: feeling stuck, disappointment, things not working, mild complaints, discouragement.
+        Angry: frustration, insults, rage, harsh profanity directed at something ("fuck this", "this is garbage", "I hate this"), impatience, blaming.
+        Neutral: instructions, requests, task descriptions, questions, enthusiasm about work, factual statements. Exclamation marks or urgency about a task do NOT make it emotional — only genuine sentiment does.
         Default to neutral when unsure. Most coding instructions are neutral regardless of tone.
         Intensity: 0.0 (barely noticeable) to 1.0 (very strong). ALL CAPS text indicates stronger emotion — increase intensity by 0.2-0.3 compared to the same message in lowercase.
         Reply with ONLY valid JSON: {"emotion": "...", "intensity": ...}
@@ -41,20 +60,27 @@ final class EmotionAnalyzer {
         let start = ContinuousClock.now
 
         guard let apiKey = AppSettings.anthropicApiKey, !apiKey.isEmpty else {
-            logger.info("No Anthropic API key configured, skipping emotion analysis")
+            logger.info("No API key configured, skipping emotion analysis")
             return ("neutral", 0.0)
         }
 
         do {
-            let result = try await callHaiku(prompt: prompt, apiKey: apiKey)
+            let result = try await callChatCompletion(prompt: prompt, apiKey: apiKey)
             let elapsed = ContinuousClock.now - start
             logger.info("Analysis took \(elapsed, privacy: .public)")
             return result
         } catch {
             let elapsed = ContinuousClock.now - start
-            logger.error("Haiku API failed (\(elapsed, privacy: .public)): \(error.localizedDescription)")
+            logger.error("Emotion API failed (\(elapsed, privacy: .public)): \(error.localizedDescription)")
             return ("neutral", 0.0)
         }
+    }
+
+    func test() async throws -> (emotion: String, intensity: Double) {
+        guard let apiKey = AppSettings.anthropicApiKey, !apiKey.isEmpty else {
+            throw URLError(.userAuthenticationRequired)
+        }
+        return try await callChatCompletion(prompt: "everything is broken again, I hate this, nothing ever works", apiKey: apiKey)
     }
 
     private static func extractJSON(from text: String) -> String {
@@ -82,18 +108,25 @@ final class EmotionAnalyzer {
         return cleaned
     }
 
-    private func callHaiku(prompt: String, apiKey: String) async throws -> (emotion: String, intensity: Double) {
-        var request = URLRequest(url: Self.apiURL)
+    private func callChatCompletion(prompt: String, apiKey: String) async throws -> (emotion: String, intensity: Double) {
+        let endpoint = AppSettings.emotionApiEndpoint
+        let model = AppSettings.emotionModel
+
+        guard let url = URL(string: endpoint) else {
+            logger.error("Invalid emotion API endpoint: \(endpoint, privacy: .public)")
+            throw URLError(.badURL)
+        }
+
+        var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
-        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
         let body: [String: Any] = [
-            "model": Self.model,
+            "model": model,
             "max_tokens": 50,
-            "system": Self.systemPrompt,
             "messages": [
+                ["role": "system", "content": Self.systemPrompt],
                 ["role": "user", "content": prompt]
             ]
         ]
@@ -106,17 +139,25 @@ final class EmotionAnalyzer {
         }
 
         guard httpResponse.statusCode == 200 else {
-            logger.warning("Haiku API returned HTTP \(httpResponse.statusCode)")
-            throw URLError(.badServerResponse)
+            let body = String(data: data, encoding: .utf8) ?? "no body"
+            logger.warning("Emotion API returned HTTP \(httpResponse.statusCode): \(body, privacy: .public)")
+            throw EmotionError.httpError(httpResponse.statusCode, body)
         }
 
-        let haikuResponse = try JSONDecoder().decode(HaikuResponse.self, from: data)
-
-        guard let text = haikuResponse.content.first?.text else {
-            throw URLError(.cannotParseResponse)
+        let chatResponse: ChatCompletionResponse
+        do {
+            chatResponse = try JSONDecoder().decode(ChatCompletionResponse.self, from: data)
+        } catch {
+            let body = String(data: data, encoding: .utf8) ?? "no body"
+            logger.warning("Failed to decode response: \(body, privacy: .public)")
+            throw EmotionError.decodeFailed(body)
         }
 
-        logger.debug("Haiku raw response: \(text, privacy: .public)")
+        guard let text = chatResponse.choices.first?.message.content else {
+            throw EmotionError.emptyResponse
+        }
+
+        logger.debug("Emotion API raw response: \(text, privacy: .public)")
 
         let jsonString = Self.extractJSON(from: text)
         let emotionResponse = try JSONDecoder().decode(EmotionResponse.self, from: Data(jsonString.utf8))

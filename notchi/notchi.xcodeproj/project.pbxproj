@@ -18,11 +18,15 @@
 
 /* Begin PBXBuildFile section */
 		47C923A02F2CFA1F00EA1E18 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = 47C923A12F2CFA1F00EA1E18 /* Sparkle */; };
+		7E240B073AC59AAD98124E87 /* EmotionParticlesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F203D654C0A63CA9DC9A2002 /* EmotionParticlesView.swift */; };
+		8F0A96DC6F1CA7B49CF869D7 /* SpriteGalleryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F146EC4B31AC5DF5F17DFD7 /* SpriteGalleryView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		47C922822F2CFA1F00EA1E18 /* notchi.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = notchi.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A11A00022F50000000EA1E18 /* Tests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = Tests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		F203D654C0A63CA9DC9A2002 /* EmotionParticlesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EmotionParticlesView.swift; sourceTree = "<group>"; };
+		0F146EC4B31AC5DF5F17DFD7 /* SpriteGalleryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpriteGalleryView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */

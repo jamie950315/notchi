@@ -9,17 +9,19 @@ final class EmotionState {
     private(set) var currentEmotion: NotchiEmotion = .neutral
     private(set) var scores: [NotchiEmotion: Double] = [
         .happy: 0.0,
-        .sad: 0.0
+        .sad: 0.0,
+        .excited: 0.0,
+        .angry: 0.0,
+        .love: 0.0
     ]
 
-    static let sadThreshold = 0.45
-    static let happyThreshold = 0.6
-    static let sobEscalationThreshold = 0.9
-    static let intensityDampen = 0.5
-    static let decayRate = 0.92
-    static let interEmotionDecay = 0.9
-    static let neutralCounterDecay = 0.85
-    static let decayInterval: Duration = .seconds(60)
+    static let emotionThreshold = 0.3
+    static let sobEscalationThreshold = 0.75
+    static let intensityDampen = 0.8
+    static let decayRate = 0.95
+    static let interEmotionDecay = 0.85
+    static let neutralCounterDecay = 0.9
+    static let decayInterval: Duration = .seconds(90)
 
     private var scoresDescription: String {
         scores
@@ -40,7 +42,6 @@ final class EmotionState {
                 scores[key, default: 0.0] *= Self.interEmotionDecay
             }
         } else {
-            // Neutral or unknown: actively counter all non-neutral scores
             for key in scores.keys {
                 scores[key, default: 0.0] *= Self.neutralCounterDecay
             }
@@ -67,19 +68,20 @@ final class EmotionState {
         }
     }
 
+    func setEmotionDirectly(_ rawEmotion: String) {
+        let emotion = NotchiEmotion(rawValue: rawEmotion) ?? .neutral
+        currentEmotion = emotion
+        logger.info("[Emotion] set directly → \(emotion.rawValue, privacy: .public)")
+    }
+
     private func updateCurrentEmotion() {
         let best = scores.max(by: { $0.value < $1.value })
 
-        if let best {
-            let threshold = best.key == .sad ? Self.sadThreshold : Self.happyThreshold
-            if best.value >= threshold {
-                if best.key == .sad && best.value >= Self.sobEscalationThreshold {
-                    currentEmotion = .sob
-                } else {
-                    currentEmotion = best.key
-                }
+        if let best, best.value >= Self.emotionThreshold {
+            if best.key == .sad && best.value >= Self.sobEscalationThreshold {
+                currentEmotion = .sob
             } else {
-                currentEmotion = .neutral
+                currentEmotion = best.key
             }
         } else {
             currentEmotion = .neutral
