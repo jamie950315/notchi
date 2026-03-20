@@ -9,6 +9,13 @@ enum ClaudeUsageRecoveryAction: Equatable {
     case reconnect
 }
 
+struct ClaudeUsageRecoverySnapshot: Codable, Equatable {
+    let oauthBackoffUntil: Date?
+    let oauthHeadersFallbackProbeUntil: Date?
+    let isHeadersFallbackActive: Bool
+    let lastGoodUsage: QuotaPeriod?
+}
+
 protocol ClaudeUsagePollTimer {
     func invalidate()
 }
@@ -17,8 +24,13 @@ struct ClaudeUsageServiceDependencies {
     var fetchUsage: (URLRequest) async throws -> (Data, URLResponse)
     var getAccessToken: () -> String?
     var getCachedOAuthToken: () -> String?
+    var getOAuthCredentials: (_ allowInteraction: Bool) -> ClaudeOAuthCredentials?
+    var cacheOAuthToken: (_ token: String) -> Void
     var refreshAccessTokenSilently: () -> String?
     var clearCachedOAuthToken: () -> Void
+    var loadRecoverySnapshot: () -> ClaudeUsageRecoverySnapshot?
+    var saveRecoverySnapshot: (ClaudeUsageRecoverySnapshot) -> Void
+    var clearRecoverySnapshot: () -> Void
     var resolveUserAgent: () -> String?
     var pollJitter: () -> Double
     var now: () -> Date
@@ -92,11 +104,26 @@ extension ClaudeUsageServiceDependencies {
         getCachedOAuthToken: {
             KeychainManager.getCachedOAuthToken()
         },
+        getOAuthCredentials: { allowInteraction in
+            KeychainManager.getOAuthCredentials(allowInteraction: allowInteraction)
+        },
+        cacheOAuthToken: { token in
+            KeychainManager.cacheOAuthToken(token)
+        },
         refreshAccessTokenSilently: {
             KeychainManager.refreshAccessTokenSilently()
         },
         clearCachedOAuthToken: {
             KeychainManager.clearCachedOAuthToken()
+        },
+        loadRecoverySnapshot: {
+            AppSettings.claudeUsageRecoverySnapshot
+        },
+        saveRecoverySnapshot: { snapshot in
+            AppSettings.claudeUsageRecoverySnapshot = snapshot
+        },
+        clearRecoverySnapshot: {
+            AppSettings.claudeUsageRecoverySnapshot = nil
         },
         resolveUserAgent: {
             ClaudeCLIResolver.resolveUserAgent()
@@ -129,16 +156,24 @@ final class ClaudeUsageService {
     var recoveryAction: ClaudeUsageRecoveryAction = .none
 
     private static let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
-    private static let authFailureStatusCodes: Set<Int> = [401, 403]
+    private static let messagesURL = URL(string: "https://api.anthropic.com/v1/messages")!
     private static let maxBackoffInterval: TimeInterval = 600
+    private static let oauthRecheckPollCount = 10
+    private static let headersFallbackOAuthProbeInterval: TimeInterval = 600
+    private static let headersFallbackRefreshInterval: TimeInterval = 60
 
     private let dependencies: ClaudeUsageServiceDependencies
     private var resolvedUserAgent: String?
     private var pollTimer: (any ClaudeUsagePollTimer)?
     private let pollInterval: TimeInterval = 60
     private var consecutiveRateLimits = 0
-    private var lastRateLimitTime: Date?
     private var cachedToken: String?
+    private var preferHeadersFallback = false
+    private var oauthRecheckCounter = 0
+    private var oauthBackoffUntil: Date?
+    private var oauthHeadersFallbackProbeUntil: Date?
+    private var isHeadersFallbackActive = false
+    private var didAttemptHeadersFallbackInOAuthBackoff = false
 
     init() {
         self.dependencies = .live
@@ -151,11 +186,14 @@ final class ClaudeUsageService {
     func connectAndStartPolling() {
         AppSettings.isUsageEnabled = true
         clearTransientState()
+        clearOAuthBackoffState()
+        preferHeadersFallback = false
+        oauthRecheckCounter = 0
         stopPolling()
 
         Task {
             guard let accessToken = dependencies.getAccessToken() else {
-                presentReconnectRequired("Keychain access required")
+                presentReconnectRequired(noUsageMessage: "Keychain access required")
                 AppSettings.isUsageEnabled = false
                 return
             }
@@ -168,29 +206,87 @@ final class ClaudeUsageService {
         stopPolling()
 
         Task {
-            guard let accessToken = dependencies.getCachedOAuthToken() else {
+            let accessToken: String
+            let silentCredentials = dependencies.getOAuthCredentials(false)
+
+            if let cachedToken = dependencies.getCachedOAuthToken() {
+                if let silentCredentials, silentCredentials.accessToken != cachedToken {
+                    accessToken = silentCredentials.accessToken
+                    dependencies.cacheOAuthToken(accessToken)
+                    logger.info("Startup adopted Claude Code credential token over mismatched cached token")
+                } else {
+                    accessToken = cachedToken
+                }
+            } else if let silentCredentials {
+                accessToken = silentCredentials.accessToken
+                dependencies.cacheOAuthToken(accessToken)
+                logger.info("Recovered cached OAuth token from Claude Code credentials for background polling")
+            } else {
                 logger.info("No cached token, user must connect manually")
                 isConnected = false
                 AppSettings.isUsageEnabled = false
+                clearOAuthBackoffState()
                 clearTransientState()
                 return
             }
+
             AppSettings.isUsageEnabled = true
             cachedToken = accessToken
+
+            restoreRecoverySnapshotIfNeeded()
+
+            if isHeadersFallbackActive {
+                if let remainingProbe = activeHeadersFallbackProbeRemaining() {
+                    scheduleHeadersFallbackActiveTimer(remainingProbe: remainingProbe)
+                } else {
+                    await performFetch(with: accessToken)
+                }
+                return
+            }
+
+            if let remainingBackoff = activeOAuthBackoffRemaining() {
+                presentOAuthBackoffState(remaining: remainingBackoff)
+                scheduleBackoffTimer(remaining: remainingBackoff)
+                return
+            }
+
             await performFetch(with: accessToken)
         }
     }
 
     func retryNow() {
         guard !isLoading else { return }
-        if let lastRL = lastRateLimitTime, dependencies.now().timeIntervalSince(lastRL) < 10 {
-            recoveryAction = .retry
-            statusMessage = "Please wait before retrying again"
-            logger.info("Retry cooldown active, ignoring tap")
+        if isHeadersFallbackActive {
+            logger.info("Retry tapped during active headers refresh mode")
+            if let remainingProbe = activeHeadersFallbackProbeRemaining() {
+                scheduleHeadersFallbackActiveTimer(remainingProbe: remainingProbe)
+            } else {
+                Task {
+                    guard let accessToken = cachedToken else {
+                        connectAndStartPolling()
+                        return
+                    }
+                    await performFetch(with: accessToken, userInitiated: true)
+                }
+            }
             return
         }
+        if let remainingBackoff = activeOAuthBackoffRemaining() {
+            logger.info("Retry tapped during active OAuth backoff")
+            Task {
+                guard let accessToken = cachedToken else {
+                    connectAndStartPolling()
+                    return
+                }
+                await handleRetryDuringOAuthBackoff(
+                    with: accessToken,
+                    remaining: remainingBackoff
+                )
+            }
+            return
+        }
+
         clearTransientState()
-        consecutiveRateLimits = 0
         stopPolling()
         Task {
             guard let accessToken = cachedToken else {
@@ -206,11 +302,11 @@ final class ClaudeUsageService {
         pollTimer = nil
     }
 
-    private func schedulePollTimer(interval: TimeInterval? = nil) {
+    private func schedulePollTimer(interval: TimeInterval? = nil, minimumInterval: TimeInterval? = nil) {
         pollTimer?.invalidate()
         let baseInterval = interval ?? pollInterval
         let jitter = dependencies.pollJitter()
-        let effectiveInterval = max(10, baseInterval + jitter)
+        let effectiveInterval = max(10, baseInterval + jitter, minimumInterval ?? 0)
         pollTimer = dependencies.schedulePoll(effectiveInterval) { [weak self] in
             Task { @MainActor [weak self] in
                 await self?.fetchUsage()
@@ -226,21 +322,192 @@ final class ClaudeUsageService {
             return
         }
 
+        if isHeadersFallbackActive {
+            if let remainingProbe = activeHeadersFallbackProbeRemaining() {
+                logger.info("Refreshing usage via headers while OAuth re-probe is \(Int(remainingProbe))s away")
+                await refreshActiveHeadersFallback(with: accessToken)
+            } else {
+                logger.info("Headers refresh window reached OAuth re-probe deadline")
+                await performFetch(with: accessToken)
+            }
+            return
+        }
+
+        if let remainingBackoff = activeOAuthBackoffRemaining() {
+            logger.info("Skipping OAuth fetch while \(Int(remainingBackoff))s of backoff remain")
+            presentOAuthBackoffState(remaining: remainingBackoff)
+            scheduleBackoffTimer(remaining: remainingBackoff)
+            return
+        }
+
         await performFetch(with: accessToken)
     }
 
+    private enum FetchResult {
+        case success
+        case handled
+        case enterprise403
+        case noHeadersFallback
+    }
+
+    private enum OAuth403Classification {
+        case authScopeFailure(rawMessage: String, errorType: String?, requestID: String?)
+        case enterpriseFallback(errorType: String?, requestID: String?)
+    }
+
+    private struct AnthropicErrorEnvelope: Decodable {
+        let error: AnthropicErrorDetail?
+        let requestID: String?
+
+        enum CodingKeys: String, CodingKey {
+            case error
+            case requestID = "request_id"
+        }
+    }
+
+    private struct AnthropicErrorDetail: Decodable {
+        let type: String?
+        let message: String?
+    }
+
+    private enum PreflightResult {
+        case proceed(String)
+        case handled
+    }
+
+    private enum HeadersFetchContext {
+        case normalRetrying
+        case normalNoRetry
+        case oauthBackoffEntry
+        case activeFallbackRefresh
+    }
+
     // Internal for unit tests that verify service state transitions directly.
-    func performFetch(with accessToken: String, userInitiated: Bool = false) async {
+    func performFetch(
+        with accessToken: String,
+        userInitiated: Bool = false,
+        allow403EmptyHeadersRecovery: Bool = true,
+        allowPreflightRefreshRecovery: Bool = true,
+        allow401RefreshRecovery: Bool = true
+    ) async {
         if userInitiated { isLoading = true }
 
         defer { if userInitiated { isLoading = false } }
 
         guard let userAgent = resolveUserAgent() else {
-            presentReconnectRequired("Claude CLI not found")
+            presentReconnectRequired(noUsageMessage: "Claude CLI not found")
             stopPolling()
             return
         }
 
+        let preflight = await preflightCredentials(
+            for: accessToken,
+            userInitiated: userInitiated,
+            allowPreflightRefreshRecovery: allowPreflightRefreshRecovery,
+            allow401RefreshRecovery: allow401RefreshRecovery
+        )
+        let effectiveAccessToken: String
+        switch preflight {
+        case let .proceed(token):
+            effectiveAccessToken = token
+        case .handled:
+            return
+        }
+
+        if await performPreferredEnterpriseHeadersFetchIfNeeded(
+            with: effectiveAccessToken,
+            userAgent: userAgent,
+            userInitiated: userInitiated,
+            allowPreflightRefreshRecovery: allowPreflightRefreshRecovery,
+            allow401RefreshRecovery: allow401RefreshRecovery
+        ) {
+            return
+        }
+
+        let result = await fetchViaOAuth(
+            with: effectiveAccessToken,
+            userAgent: userAgent,
+            userInitiated: userInitiated,
+            allowPreflightRefreshRecovery: allowPreflightRefreshRecovery,
+            allow401RefreshRecovery: allow401RefreshRecovery
+        )
+
+        if case .enterprise403 = result {
+            await handleEnterprise403Fallback(
+                with: effectiveAccessToken,
+                userAgent: userAgent,
+                userInitiated: userInitiated,
+                allow403EmptyHeadersRecovery: allow403EmptyHeadersRecovery,
+                allowPreflightRefreshRecovery: allowPreflightRefreshRecovery,
+                allow401RefreshRecovery: allow401RefreshRecovery
+            )
+        }
+    }
+
+    private func performPreferredEnterpriseHeadersFetchIfNeeded(
+        with accessToken: String,
+        userAgent: String,
+        userInitiated: Bool,
+        allowPreflightRefreshRecovery: Bool,
+        allow401RefreshRecovery: Bool
+    ) async -> Bool {
+        guard preferHeadersFallback else {
+            return false
+        }
+
+        oauthRecheckCounter += 1
+        if oauthRecheckCounter >= Self.oauthRecheckPollCount {
+            oauthRecheckCounter = 0
+            return false
+        }
+
+        _ = await fetchViaHeaders(
+            with: accessToken,
+            userAgent: userAgent,
+            userInitiated: userInitiated,
+            context: .normalRetrying,
+            allowPreflightRefreshRecovery: allowPreflightRefreshRecovery,
+            allow401RefreshRecovery: allow401RefreshRecovery
+        )
+        return true
+    }
+
+    private func handleEnterprise403Fallback(
+        with accessToken: String,
+        userAgent: String,
+        userInitiated: Bool,
+        allow403EmptyHeadersRecovery: Bool,
+        allowPreflightRefreshRecovery: Bool,
+        allow401RefreshRecovery: Bool
+    ) async {
+        preferHeadersFallback = true
+        oauthRecheckCounter = 0
+        let fallbackResult = await fetchViaHeaders(
+            with: accessToken,
+            userAgent: userAgent,
+            userInitiated: userInitiated,
+            context: .normalNoRetry,
+            allowPreflightRefreshRecovery: allowPreflightRefreshRecovery,
+            allow401RefreshRecovery: allow401RefreshRecovery
+        )
+        if case .noHeadersFallback = fallbackResult {
+            preferHeadersFallback = false
+            if allow403EmptyHeadersRecovery {
+                await recoverFromEmptyHeadersFallback(afterOAuth403With: accessToken, userInitiated: userInitiated)
+            } else {
+                presentReconnectRequired(noUsageMessage: "Claude authentication needs attention. Reconnect Claude Code.")
+                stopPolling()
+            }
+        }
+    }
+
+    private func fetchViaOAuth(
+        with accessToken: String,
+        userAgent: String,
+        userInitiated: Bool,
+        allowPreflightRefreshRecovery: Bool,
+        allow401RefreshRecovery: Bool
+    ) async -> FetchResult {
         var request = URLRequest(url: Self.usageURL)
         request.timeoutInterval = 30
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
@@ -248,7 +515,7 @@ final class ClaudeUsageService {
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
 
-        logger.info("Fetching usage — User-Agent: \(userAgent)")
+        logger.info("Fetching usage via OAuth — User-Agent: \(userAgent)")
 
         do {
             let (data, response) = try await dependencies.fetchUsage(request)
@@ -256,23 +523,16 @@ final class ClaudeUsageService {
             guard let httpResponse = response as? HTTPURLResponse else {
                 presentRetryableIssue(
                     noUsageMessage: "Invalid response, retrying in \(Int(pollInterval))s",
-                    staleMessage: "Stale response, retrying in \(Int(pollInterval))s"
+                    staleMessage: "Updating soon"
                 )
                 schedulePollTimer()
-                return
+                return .handled
             }
 
             guard httpResponse.statusCode == 200 else {
-                let headers = httpResponse.allHeaderFields.map { "\($0.key): \($0.value)" }.joined(separator: ", ")
-                logger.warning("HTTP \(httpResponse.statusCode) — headers: \(headers)")
-
                 if httpResponse.statusCode == 429 {
-                    let body = String(data: data, encoding: .utf8) ?? "<unreadable>"
-                    logger.warning("429 response body: \(body)")
-                    lastRateLimitTime = dependencies.now()
                     consecutiveRateLimits += 1
 
-                    // After 3 consecutive 429s, try refreshing the token for a fresh rate limit window
                     if consecutiveRateLimits >= 3,
                        let freshToken = dependencies.refreshAccessTokenSilently(),
                        freshToken != accessToken {
@@ -280,7 +540,7 @@ final class ClaudeUsageService {
                         consecutiveRateLimits = 0
                         logger.info("Token refreshed after persistent 429s")
                         await performFetch(with: freshToken, userInitiated: userInitiated)
-                        return
+                        return .handled
                     }
 
                     let exponentialDelay = pollInterval * pow(2.0, Double(consecutiveRateLimits))
@@ -290,58 +550,422 @@ final class ClaudeUsageService {
                         backoffDelay = min(max(backoffDelay, retrySeconds), Self.maxBackoffInterval)
                     }
 
-                    presentRetryableIssue(
-                        noUsageMessage: "Rate limited, retrying in \(Int(backoffDelay))s",
-                        staleMessage: "Stale, retrying in \(Int(backoffDelay))s"
-                    )
-                    logger.warning("Rate limited (429), backing off \(Int(backoffDelay))s (attempt \(self.consecutiveRateLimits))")
-                    schedulePollTimer(interval: backoffDelay)
-                    return
-                }
+                    beginOAuthBackoff(delay: backoffDelay)
+                    logger.warning("OAuth 429 entered backoff for \(Int(backoffDelay))s (attempt \(self.consecutiveRateLimits))")
 
-                if Self.authFailureStatusCodes.contains(httpResponse.statusCode) {
-                    cachedToken = nil
-                    dependencies.clearCachedOAuthToken()
-
-                    if let freshToken = dependencies.refreshAccessTokenSilently(),
-                       freshToken != accessToken {
-                        consecutiveRateLimits = 0
-                        cachedToken = freshToken
-                        logger.info("Token refreshed silently from Claude Code keychain")
-                        await performFetch(with: freshToken, userInitiated: userInitiated)
-                        return
+                    if !didAttemptHeadersFallbackInOAuthBackoff {
+                        didAttemptHeadersFallbackInOAuthBackoff = true
+                        let hadCurrentUsage = currentUsage != nil
+                        let fallbackResult = await fetchViaHeaders(
+                            with: accessToken,
+                            userAgent: userAgent,
+                            userInitiated: userInitiated,
+                            context: .oauthBackoffEntry,
+                            allowPreflightRefreshRecovery: allowPreflightRefreshRecovery,
+                            allow401RefreshRecovery: allow401RefreshRecovery
+                        )
+                        if case .success = fallbackResult {
+                            logger.info(
+                                "OAuth 429 entered headers refresh mode: refresh every \(Int(Self.headersFallbackRefreshInterval))s, OAuth probe in \(Int(Self.headersFallbackOAuthProbeInterval))s"
+                            )
+                            return .handled
+                        }
+                        if hadCurrentUsage {
+                            clearTransientState()
+                            beginHeadersFallbackProbeWindow()
+                            logger.info("OAuth 429 keeping the last good usage visible while headers refreshes continue")
+                            scheduleHeadersFallbackActiveTimer()
+                            return .handled
+                        }
                     }
 
-                    presentReconnectRequired("Token expired")
-                    stopPolling()
-                } else {
-                    presentRetryableIssue(
-                        noUsageMessage: "HTTP \(httpResponse.statusCode), retrying in \(Int(pollInterval))s",
-                        staleMessage: "Stale (HTTP \(httpResponse.statusCode)), retrying in \(Int(pollInterval))s"
-                    )
-                    schedulePollTimer()
+                    presentOAuthBackoffState(remaining: backoffDelay)
+                    scheduleBackoffTimer(remaining: backoffDelay)
+                    return .handled
                 }
+
+                let headers = httpResponse.allHeaderFields.map { "\($0.key): \($0.value)" }.joined(separator: ", ")
+                logger.warning("OAuth HTTP \(httpResponse.statusCode) — headers: \(headers)")
+
+                if httpResponse.statusCode == 403 {
+                    return handleOAuthForbidden(data: data, response: httpResponse)
+                }
+
+                if httpResponse.statusCode == 401 {
+                    await handleAuthFailure(
+                        currentToken: accessToken,
+                        userInitiated: userInitiated,
+                        allowPreflightRefreshRecovery: allowPreflightRefreshRecovery,
+                        allow401RefreshRecovery: allow401RefreshRecovery
+                    )
+                    return .handled
+                }
+
+                clearOAuthBackoffState()
+                presentRetryableIssue(
+                    noUsageMessage: "HTTP \(httpResponse.statusCode), retrying in \(Int(pollInterval))s",
+                    staleMessage: "Updating soon"
+                )
+                schedulePollTimer()
                 logger.warning("API error: HTTP \(httpResponse.statusCode)")
-                return
+                return .handled
             }
 
             let usageResponse = try JSONDecoder().decode(UsageResponse.self, from: data)
             consecutiveRateLimits = 0
-            lastRateLimitTime = nil
+            clearOAuthBackoffState()
             isConnected = true
+            preferHeadersFallback = false
             clearTransientState()
             currentUsage = usageResponse.fiveHour
-            logger.info("Usage fetched: \(self.currentUsage?.usagePercentage ?? 0)%")
+            logger.info("Usage fetched via OAuth: \(self.currentUsage?.usagePercentage ?? 0)%")
             schedulePollTimer()
+            return .success
 
         } catch {
             presentRetryableIssue(
                 noUsageMessage: "Network error, retrying in \(Int(pollInterval))s",
-                staleMessage: "Stale network data, retrying in \(Int(pollInterval))s"
+                staleMessage: "Updating soon"
             )
-            logger.error("Fetch failed: \(error.localizedDescription)")
+            logger.error("OAuth fetch failed: \(error.localizedDescription)")
             schedulePollTimer()
+            return .handled
         }
+    }
+
+    @discardableResult
+    private func fetchViaHeaders(
+        with accessToken: String,
+        userAgent: String,
+        userInitiated: Bool,
+        context: HeadersFetchContext = .normalRetrying,
+        allowPreflightRefreshRecovery: Bool = true,
+        allow401RefreshRecovery: Bool = true
+    ) async -> FetchResult {
+        var request = URLRequest(url: Self.messagesURL)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 30
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+
+        let body: [String: Any] = [
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 1,
+            "messages": [["role": "user", "content": "x"]],
+        ]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        logger.info("Fetching usage via headers fallback")
+
+        do {
+            let (_, response) = try await dependencies.fetchUsage(request)
+
+            guard let httpResponse = response as? HTTPURLResponse else {
+                switch context {
+                case .activeFallbackRefresh:
+                    return handleActiveHeadersFallbackMiss(logMessage: "Headers fallback returned invalid response during active fallback refresh")
+                case .oauthBackoffEntry:
+                    logger.warning("Headers fallback returned invalid response during OAuth backoff")
+                    return .noHeadersFallback
+                case .normalRetrying, .normalNoRetry:
+                    presentRetryableIssue(
+                        noUsageMessage: "Invalid response, retrying in \(Int(pollInterval))s",
+                        staleMessage: "Updating soon"
+                    )
+                    schedulePollTimer()
+                    return .handled
+                }
+            }
+
+            if httpResponse.statusCode == 401 {
+                await handleAuthFailure(
+                    currentToken: accessToken,
+                    userInitiated: userInitiated,
+                    allowPreflightRefreshRecovery: allowPreflightRefreshRecovery,
+                    allow401RefreshRecovery: allow401RefreshRecovery
+                )
+                return .handled
+            }
+
+            guard let utilization = parseHeaderUtilization(from: httpResponse) else {
+                logger.debug("No unified rate limit headers in response")
+                switch context {
+                case .activeFallbackRefresh:
+                    return handleActiveHeadersFallbackMiss(logMessage: "No unified rate limit headers in active fallback refresh response")
+                case .oauthBackoffEntry, .normalNoRetry:
+                    return .noHeadersFallback
+                case .normalRetrying:
+                    presentRetryableIssue(
+                        noUsageMessage: "No rate limit headers, retrying in \(Int(pollInterval))s",
+                        staleMessage: "Updating soon"
+                    )
+                    schedulePollTimer()
+                    return .noHeadersFallback
+                }
+            }
+
+            let resetDate = parseHeaderResetDate(from: httpResponse)
+            let usage = QuotaPeriod(utilization: (utilization * 100).rounded(), resetDate: resetDate)
+            isConnected = true
+            currentUsage = usage
+
+            switch context {
+            case .activeFallbackRefresh:
+                clearTransientState()
+                persistRecoverySnapshotIfNeeded()
+                logger.info("Usage refreshed via active headers mode: \(usage.usagePercentage)%")
+                scheduleHeadersFallbackActiveTimer()
+                return .success
+            case .oauthBackoffEntry:
+                clearTransientState()
+                beginHeadersFallbackProbeWindow()
+                logger.info("Usage fetched via headers during OAuth backoff: \(usage.usagePercentage)%")
+                scheduleHeadersFallbackActiveTimer()
+                return .success
+            case .normalRetrying, .normalNoRetry:
+                consecutiveRateLimits = 0
+                clearOAuthBackoffState()
+                clearTransientState()
+                logger.info("Usage fetched via headers: \(usage.usagePercentage)%")
+                schedulePollTimer()
+                return .success
+            }
+
+        } catch {
+            switch context {
+            case .activeFallbackRefresh:
+                return handleActiveHeadersFallbackMiss(logMessage: "Headers fetch failed during active fallback refresh: \(error.localizedDescription)")
+            case .oauthBackoffEntry:
+                logger.error("Headers fetch failed during OAuth backoff: \(error.localizedDescription)")
+                return .noHeadersFallback
+            case .normalRetrying, .normalNoRetry:
+                presentRetryableIssue(
+                    noUsageMessage: "Network error, retrying in \(Int(pollInterval))s",
+                    staleMessage: "Updating soon"
+                )
+                logger.error("Headers fetch failed: \(error.localizedDescription)")
+                schedulePollTimer()
+                return .handled
+            }
+        }
+    }
+
+    private func refreshActiveHeadersFallback(with accessToken: String) async {
+        guard let userAgent = resolveUserAgent() else {
+            presentReconnectRequired(noUsageMessage: "Claude CLI not found")
+            stopPolling()
+            return
+        }
+
+        _ = await fetchViaHeaders(
+            with: accessToken,
+            userAgent: userAgent,
+            userInitiated: false,
+            context: .activeFallbackRefresh
+        )
+    }
+
+    private func handleAuthFailure(
+        currentToken: String,
+        userInitiated: Bool,
+        allowPreflightRefreshRecovery: Bool,
+        allow401RefreshRecovery: Bool
+    ) async {
+        cachedToken = nil
+        clearOAuthBackoffState()
+        preferHeadersFallback = false
+        oauthRecheckCounter = 0
+        dependencies.clearCachedOAuthToken()
+
+        if allow401RefreshRecovery,
+           let freshToken = dependencies.refreshAccessTokenSilently(),
+           freshToken != currentToken {
+            consecutiveRateLimits = 0
+            cachedToken = freshToken
+            logger.info("Token refreshed silently from Claude Code keychain")
+            await performFetch(
+                with: freshToken,
+                userInitiated: userInitiated,
+                allowPreflightRefreshRecovery: allowPreflightRefreshRecovery,
+                allow401RefreshRecovery: false
+            )
+            return
+        }
+
+        presentReconnectRequired(noUsageMessage: "Token expired")
+        stopPolling()
+    }
+
+    private func preflightCredentials(
+        for accessToken: String,
+        userInitiated: Bool,
+        allowPreflightRefreshRecovery: Bool,
+        allow401RefreshRecovery: Bool
+    ) async -> PreflightResult {
+        guard let credentials = dependencies.getOAuthCredentials(userInitiated) else {
+            return .proceed(accessToken)
+        }
+
+        let usesCredentialMetadata: Bool
+        let effectiveAccessToken: String
+
+        if userInitiated {
+            usesCredentialMetadata = true
+            effectiveAccessToken = credentials.accessToken
+            if effectiveAccessToken != accessToken {
+                cachedToken = effectiveAccessToken
+            }
+        } else if credentials.accessToken == accessToken {
+            usesCredentialMetadata = true
+            effectiveAccessToken = accessToken
+        } else {
+            usesCredentialMetadata = false
+            effectiveAccessToken = accessToken
+            logger.info("Silent OAuth credential metadata token mismatch; using cached token")
+        }
+
+        if usesCredentialMetadata,
+           !credentials.scopes.isEmpty,
+           !credentials.scopes.contains("user:profile") {
+            presentReconnectRequired(noUsageMessage: "Claude OAuth permissions missing. Reconnect Claude Code.")
+            stopPolling()
+            return .handled
+        }
+
+        if usesCredentialMetadata,
+           let expiresAt = credentials.expiresAt,
+           expiresAt <= dependencies.now() {
+            logger.info("Local OAuth credential metadata shows expired token before request")
+
+            if allowPreflightRefreshRecovery,
+               let freshToken = dependencies.refreshAccessTokenSilently(),
+               freshToken != effectiveAccessToken {
+                cachedToken = freshToken
+                consecutiveRateLimits = 0
+                logger.info("Token refreshed silently from local credential preflight")
+                await performFetch(
+                    with: freshToken,
+                    userInitiated: userInitiated,
+                    allowPreflightRefreshRecovery: false,
+                    allow401RefreshRecovery: allow401RefreshRecovery
+                )
+                return .handled
+            }
+
+            presentReconnectRequired(noUsageMessage: "Token expired")
+            stopPolling()
+            return .handled
+        }
+
+        return .proceed(effectiveAccessToken)
+    }
+
+    private func recoverFromEmptyHeadersFallback(afterOAuth403With currentToken: String, userInitiated: Bool) async {
+        logger.info("OAuth 403 with empty headers fallback triggered silent refresh recovery")
+        cachedToken = nil
+        clearOAuthBackoffState()
+        dependencies.clearCachedOAuthToken()
+
+        if let freshToken = dependencies.refreshAccessTokenSilently(),
+           freshToken != currentToken {
+            cachedToken = freshToken
+            consecutiveRateLimits = 0
+            await performFetch(
+                with: freshToken,
+                userInitiated: userInitiated,
+                allow403EmptyHeadersRecovery: false
+            )
+            return
+        }
+
+        presentReconnectRequired(noUsageMessage: "Claude authentication needs attention. Reconnect Claude Code.")
+        stopPolling()
+    }
+
+    private func handleOAuthForbidden(data: Data, response: HTTPURLResponse) -> FetchResult {
+        let classification = classifyOAuth403(data: data, response: response)
+
+        switch classification {
+        case let .authScopeFailure(rawMessage, errorType, requestID):
+            let errorTypeLog = errorType ?? "unknown"
+            let requestIDLog = requestID ?? "none"
+            logger.warning(
+                "OAuth 403 requires reconnect - errorType: \(errorTypeLog, privacy: .public), requestID: \(requestIDLog, privacy: .public), message: \(rawMessage, privacy: .public)"
+            )
+            presentReconnectRequired(noUsageMessage: "Claude OAuth permissions missing. Reconnect Claude Code.")
+            stopPolling()
+            return .handled
+
+        case let .enterpriseFallback(errorType, requestID):
+            let errorTypeLog = errorType ?? "unknown"
+            let requestIDLog = requestID ?? "none"
+            logger.info(
+                "OAuth 403 trying headers fallback - errorType: \(errorTypeLog, privacy: .public), requestID: \(requestIDLog, privacy: .public)"
+            )
+            return .enterprise403
+        }
+    }
+
+    private func classifyOAuth403(data: Data, response: HTTPURLResponse) -> OAuth403Classification {
+        guard !data.isEmpty,
+              let envelope = try? JSONDecoder().decode(AnthropicErrorEnvelope.self, from: data) else {
+            return .enterpriseFallback(
+                errorType: nil,
+                requestID: response.value(forHTTPHeaderField: "request-id")
+            )
+        }
+
+        let errorType = envelope.error?.type?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let message = envelope.error?.message?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let requestID = envelope.requestID ?? response.value(forHTTPHeaderField: "request-id")
+
+        guard errorType == "permission_error",
+              let message,
+              isExplicitOAuthScopeFailure(message: message) else {
+            return .enterpriseFallback(errorType: errorType, requestID: requestID)
+        }
+
+        return .authScopeFailure(
+            rawMessage: message,
+            errorType: errorType,
+            requestID: requestID
+        )
+    }
+
+    private func isExplicitOAuthScopeFailure(message: String) -> Bool {
+        let normalized = message.lowercased()
+        return normalized.contains("user:profile")
+            || normalized.contains("missing scope")
+            || normalized.contains("scope requirement")
+            || (normalized.contains("oauth") && normalized.contains("scope"))
+    }
+
+    private func parseHeaderUtilization(from response: HTTPURLResponse) -> Double? {
+        guard let value = response.value(forHTTPHeaderField: "anthropic-ratelimit-unified-5h-utilization") else {
+            return nil
+        }
+        return Double(value.trimmingCharacters(in: .whitespaces))
+    }
+
+    private static let isoFractional: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    private static let isoBasic = ISO8601DateFormatter()
+
+    private func parseHeaderResetDate(from response: HTTPURLResponse) -> Date? {
+        guard let value = response.value(forHTTPHeaderField: "anthropic-ratelimit-unified-5h-reset"),
+              !value.isEmpty else {
+            return nil
+        }
+        if let epoch = TimeInterval(value) {
+            return Date(timeIntervalSince1970: epoch)
+        }
+        return Self.isoFractional.date(from: value) ?? Self.isoBasic.date(from: value)
     }
 
     private func resolveUserAgent() -> String? {
@@ -365,6 +989,203 @@ final class ClaudeUsageService {
         recoveryAction = .none
     }
 
+    private func activeOAuthBackoffRemaining() -> TimeInterval? {
+        guard let oauthBackoffUntil else {
+            return nil
+        }
+
+        let remaining = oauthBackoffUntil.timeIntervalSince(dependencies.now())
+        if remaining > 0 {
+            return remaining
+        }
+
+        clearOAuthBackoffState()
+        return nil
+    }
+
+    private func activeHeadersFallbackProbeRemaining() -> TimeInterval? {
+        guard isHeadersFallbackActive,
+              let currentProbeUntil = oauthHeadersFallbackProbeUntil else {
+            return nil
+        }
+
+        let remaining = currentProbeUntil.timeIntervalSince(dependencies.now())
+        if remaining > 0 {
+            return remaining
+        }
+        return nil
+    }
+
+    private func beginOAuthBackoff(delay: TimeInterval) {
+        let now = dependencies.now()
+        let newBackoffUntil = now.addingTimeInterval(delay)
+        isHeadersFallbackActive = false
+        oauthHeadersFallbackProbeUntil = nil
+        if let currentBackoffUntil = oauthBackoffUntil,
+           currentBackoffUntil > now {
+            oauthBackoffUntil = max(currentBackoffUntil, newBackoffUntil)
+            return
+        }
+
+        oauthBackoffUntil = newBackoffUntil
+        didAttemptHeadersFallbackInOAuthBackoff = false
+        persistRecoverySnapshotIfNeeded()
+    }
+
+    private func clearOAuthBackoffState() {
+        oauthBackoffUntil = nil
+        oauthHeadersFallbackProbeUntil = nil
+        isHeadersFallbackActive = false
+        didAttemptHeadersFallbackInOAuthBackoff = false
+        dependencies.clearRecoverySnapshot()
+    }
+
+    private func beginHeadersFallbackProbeWindow() {
+        oauthBackoffUntil = nil
+        consecutiveRateLimits = 0
+        isHeadersFallbackActive = true
+        oauthHeadersFallbackProbeUntil = dependencies.now().addingTimeInterval(Self.headersFallbackOAuthProbeInterval)
+        didAttemptHeadersFallbackInOAuthBackoff = false
+        persistRecoverySnapshotIfNeeded()
+    }
+
+    private func scheduleBackoffTimer(remaining: TimeInterval) {
+        let baseInterval = max(remaining, pollInterval)
+        schedulePollTimer(interval: baseInterval, minimumInterval: remaining)
+    }
+
+    private func scheduleHeadersFallbackActiveTimer(remainingProbe: TimeInterval? = nil) {
+        let probeRemaining = remainingProbe ?? activeHeadersFallbackProbeRemaining()
+        guard let probeRemaining else {
+            clearOAuthBackoffState()
+            schedulePollTimer()
+            return
+        }
+        let nextInterval = min(Self.headersFallbackRefreshInterval, probeRemaining)
+        schedulePollTimer(interval: nextInterval, minimumInterval: nextInterval)
+    }
+
+    private func presentOAuthBackoffState(remaining: TimeInterval) {
+        recoveryAction = .retry
+        let roundedDelay = Int(ceil(remaining))
+
+        if currentUsage == nil {
+            error = "Rate limited, retrying in \(roundedDelay)s"
+            statusMessage = nil
+            isUsageStale = false
+            return
+        }
+
+        error = nil
+        statusMessage = "Updating in \(roundedDelay)s"
+        isUsageStale = true
+    }
+
+    private func handleRetryDuringOAuthBackoff(with accessToken: String, remaining: TimeInterval) async {
+        if !didAttemptHeadersFallbackInOAuthBackoff {
+            guard let userAgent = resolveUserAgent() else {
+                presentReconnectRequired(noUsageMessage: "Claude CLI not found")
+                stopPolling()
+                return
+            }
+
+            didAttemptHeadersFallbackInOAuthBackoff = true
+            let fallbackResult = await fetchViaHeaders(
+                with: accessToken,
+                userAgent: userAgent,
+                userInitiated: true,
+                context: .oauthBackoffEntry
+            )
+            if case .success = fallbackResult {
+                return
+            }
+        }
+
+        presentOAuthBackoffState(remaining: remaining)
+        scheduleBackoffTimer(remaining: remaining)
+    }
+
+    private func handleActiveHeadersFallbackMiss(logMessage: String) -> FetchResult {
+        logger.warning("\(logMessage, privacy: .public)")
+
+        let now = dependencies.now()
+        guard isUsageStillValid(currentUsage, now: now) else {
+            currentUsage = nil
+            clearOAuthBackoffState()
+            presentRetryableIssue(
+                noUsageMessage: "No rate limit headers, retrying in \(Int(pollInterval))s",
+                staleMessage: "Updating soon"
+            )
+            schedulePollTimer()
+            return .handled
+        }
+
+        clearTransientState()
+        persistRecoverySnapshotIfNeeded()
+        scheduleHeadersFallbackActiveTimer()
+        return .handled
+    }
+
+    private func restoreRecoverySnapshotIfNeeded() {
+        guard let snapshot = dependencies.loadRecoverySnapshot() else {
+            return
+        }
+
+        let now = dependencies.now()
+        let hasActiveHeadersFallback = snapshot.isHeadersFallbackActive
+            && snapshot.oauthHeadersFallbackProbeUntil.map({ $0 > now }) ?? false
+        let hasActiveOAuthBackoff = snapshot.oauthBackoffUntil.map({ $0 > now }) ?? false
+
+        guard hasActiveHeadersFallback || hasActiveOAuthBackoff else {
+            dependencies.clearRecoverySnapshot()
+            return
+        }
+
+        currentUsage = isUsageStillValid(snapshot.lastGoodUsage, now: now) ? snapshot.lastGoodUsage : nil
+        oauthBackoffUntil = hasActiveOAuthBackoff ? snapshot.oauthBackoffUntil : nil
+        oauthHeadersFallbackProbeUntil = hasActiveHeadersFallback ? snapshot.oauthHeadersFallbackProbeUntil : nil
+        isHeadersFallbackActive = hasActiveHeadersFallback
+        didAttemptHeadersFallbackInOAuthBackoff = false
+
+        if hasActiveHeadersFallback, currentUsage != nil {
+            isConnected = true
+            clearTransientState()
+            logger.info("Restored active headers refresh mode from persistence")
+        } else if hasActiveOAuthBackoff {
+            logger.info("Restored OAuth recovery window from persistence")
+        }
+    }
+
+    private func persistRecoverySnapshotIfNeeded() {
+        guard let snapshot = makeRecoverySnapshot() else {
+            dependencies.clearRecoverySnapshot()
+            return
+        }
+        dependencies.saveRecoverySnapshot(snapshot)
+    }
+
+    private func makeRecoverySnapshot() -> ClaudeUsageRecoverySnapshot? {
+        guard oauthBackoffUntil != nil
+            || (isHeadersFallbackActive && oauthHeadersFallbackProbeUntil != nil) else {
+            return nil
+        }
+
+        let usageToPersist = isUsageStillValid(currentUsage, now: dependencies.now()) ? currentUsage : nil
+        return ClaudeUsageRecoverySnapshot(
+            oauthBackoffUntil: oauthBackoffUntil,
+            oauthHeadersFallbackProbeUntil: oauthHeadersFallbackProbeUntil,
+            isHeadersFallbackActive: isHeadersFallbackActive,
+            lastGoodUsage: usageToPersist
+        )
+    }
+
+    private func isUsageStillValid(_ usage: QuotaPeriod?, now: Date) -> Bool {
+        guard let usage, let resetDate = usage.resetDate else {
+            return false
+        }
+        return resetDate > now
+    }
+
     private func presentRetryableIssue(noUsageMessage: String, staleMessage: String) {
         recoveryAction = .retry
         if currentUsage == nil {
@@ -378,16 +1199,16 @@ final class ClaudeUsageService {
         }
     }
 
-    private func presentReconnectRequired(_ message: String) {
+    private func presentReconnectRequired(noUsageMessage: String) {
         recoveryAction = .reconnect
         isConnected = false
         if currentUsage == nil {
-            error = message
+            error = noUsageMessage
             statusMessage = nil
             isUsageStale = false
         } else {
             error = nil
-            statusMessage = message
+            statusMessage = "Tap to reconnect Claude Code"
             isUsageStale = true
         }
     }

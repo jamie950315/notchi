@@ -12,7 +12,7 @@ struct UsageBarView: View {
     var onConnect: (() -> Void)?
     var onRetry: (() -> Void)?
 
-    private var actionHint: String? {
+    var actionHint: String? {
         switch recoveryAction {
         case .retry:
             return "(tap to retry)"
@@ -38,8 +38,29 @@ struct UsageBarView: View {
         }
     }
 
+    var shouldShowConnectPlaceholder: Bool {
+        !isEnabled
+            && usage == nil
+            && !isLoading
+            && error == nil
+            && statusMessage == nil
+            && !isStale
+            && recoveryAction == .none
+    }
+
+    var shouldAllowTapAction: Bool {
+        switch recoveryAction {
+        case .reconnect:
+            return true
+        case .retry:
+            return usage == nil
+        case .none:
+            return false
+        }
+    }
+
     var body: some View {
-        if !isEnabled {
+        if shouldShowConnectPlaceholder {
             Button(action: { onConnect?() }) {
                 HStack(spacing: 4) {
                     Image(systemName: "lock.shield")
@@ -74,19 +95,22 @@ struct UsageBarView: View {
                         }
                     }
                 } else if let usage, let resetTime = usage.formattedResetTime {
-                    VStack(alignment: .leading, spacing: 2) {
+                    HStack(alignment: .firstTextBaseline, spacing: 4) {
                         Text("Resets in \(resetTime)")
                             .font(.system(size: 11, weight: .medium))
                             .foregroundColor(TerminalColors.secondaryText)
+                            .lineLimit(1)
                         if let statusMessage {
-                            Text(statusMessage)
-                                .font(.system(size: 10))
+                            Text("• \(statusMessage)")
+                                .font(.system(size: 9))
                                 .foregroundColor(TerminalColors.dimmedText)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
                         }
                     }
                 } else if let statusMessage, usage != nil {
                     Text(statusMessage)
-                        .font(.system(size: 11, weight: .medium))
+                        .font(.system(size: 10))
                         .foregroundColor(TerminalColors.dimmedText)
                 } else {
                     Text("Claude Usage")
@@ -108,6 +132,7 @@ struct UsageBarView: View {
         }
         .contentShape(Rectangle())
         .onTapGesture {
+            guard shouldAllowTapAction else { return }
             switch recoveryAction {
             case .retry:
                 onRetry?()
