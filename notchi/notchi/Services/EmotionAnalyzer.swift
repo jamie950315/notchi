@@ -141,8 +141,8 @@ final class EmotionAnalyzer {
         }
 
         guard httpResponse.statusCode == 200 else {
-            let body = String(data: data, encoding: .utf8) ?? "no body"
-            logger.warning("Emotion API returned HTTP \(httpResponse.statusCode): \(body, privacy: .public)")
+            let body = String(data: data.prefix(200), encoding: .utf8) ?? "no body"
+            logger.warning("Emotion API returned HTTP \(httpResponse.statusCode): \(body, privacy: .private)")
             throw EmotionError.httpError(httpResponse.statusCode, body)
         }
 
@@ -150,9 +150,8 @@ final class EmotionAnalyzer {
         do {
             chatResponse = try JSONDecoder().decode(ChatCompletionResponse.self, from: data)
         } catch {
-            let body = String(data: data, encoding: .utf8) ?? "no body"
-            logger.warning("Failed to decode response: \(body, privacy: .public)")
-            throw EmotionError.decodeFailed(body)
+            logger.warning("Failed to decode emotion API response")
+            throw EmotionError.decodeFailed("decode error")
         }
 
         guard let text = chatResponse.choices.first?.message.content else {
