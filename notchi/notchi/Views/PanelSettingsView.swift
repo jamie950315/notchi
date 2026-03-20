@@ -184,18 +184,25 @@ struct PanelSettingsView: View {
         }
     }
 
+    @State private var testTask: Task<Void, Never>?
+
     private func testEmotionApi() {
+        testTask?.cancel()
         testState = .testing
-        Task {
+        testTask = Task {
             do {
                 _ = try await EmotionAnalyzer.shared.test()
+                guard !Task.isCancelled else { return }
                 testState = .success("")
             } catch let error as URLError where error.code == .userAuthenticationRequired {
+                guard !Task.isCancelled else { return }
                 testState = .failure("No API key")
             } catch {
+                guard !Task.isCancelled else { return }
                 testState = .failure(error.localizedDescription)
             }
             try? await Task.sleep(for: .seconds(4))
+            guard !Task.isCancelled else { return }
             testState = .idle
         }
     }
@@ -225,12 +232,16 @@ struct PanelSettingsView: View {
         AppSettings.anthropicApiKey = trimmedKey.isEmpty ? nil : trimmedKey
 
         let trimmedEndpoint = endpointInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmedEndpoint.isEmpty {
+        if trimmedEndpoint.isEmpty {
+            UserDefaults.standard.removeObject(forKey: "emotionApiEndpoint")
+        } else {
             AppSettings.emotionApiEndpoint = trimmedEndpoint
         }
 
         let trimmedModel = modelInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmedModel.isEmpty {
+        if trimmedModel.isEmpty {
+            UserDefaults.standard.removeObject(forKey: "emotionModel")
+        } else {
             AppSettings.emotionModel = trimmedModel
         }
     }

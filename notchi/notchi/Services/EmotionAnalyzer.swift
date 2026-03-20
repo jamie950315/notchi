@@ -112,8 +112,10 @@ final class EmotionAnalyzer {
         let endpoint = AppSettings.emotionApiEndpoint
         let model = AppSettings.emotionModel
 
-        guard let url = URL(string: endpoint) else {
-            logger.error("Invalid emotion API endpoint: \(endpoint, privacy: .public)")
+        guard let url = URL(string: endpoint),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "https" || (scheme == "http" && (url.host == "localhost" || url.host == "127.0.0.1")) else {
+            logger.error("Invalid or insecure emotion API endpoint: \(endpoint, privacy: .public)")
             throw URLError(.badURL)
         }
 

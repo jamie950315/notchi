@@ -56,10 +56,11 @@ private struct SparkleParticles: View {
         }
         .frame(width: size, height: size)
         .onAppear { startEmitting() }
-        .onDisappear { timer?.invalidate() }
+        .onDisappear { timer?.invalidate(); timer = nil }
     }
 
     private func startEmitting() {
+        guard timer == nil else { return }
         timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { _ in
             Task { @MainActor in
                 let p = SparkleParticle(
@@ -116,10 +117,11 @@ private struct SteamParticles: View {
         }
         .frame(width: size, height: size)
         .onAppear { startEmitting() }
-        .onDisappear { timer?.invalidate() }
+        .onDisappear { timer?.invalidate(); timer = nil }
     }
 
     private func startEmitting() {
+        guard timer == nil else { return }
         timer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { _ in
             Task { @MainActor in
                 let side: CGFloat = Bool.random() ? -1 : 1
@@ -175,10 +177,11 @@ private struct HeartParticles: View {
         }
         .frame(width: size, height: size)
         .onAppear { startEmitting() }
-        .onDisappear { timer?.invalidate() }
+        .onDisappear { timer?.invalidate(); timer = nil }
     }
 
     private func startEmitting() {
+        guard timer == nil else { return }
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in
             Task { @MainActor in
                 let h = HeartParticle(
@@ -234,10 +237,11 @@ private struct NoteParticles: View {
         }
         .frame(width: size, height: size)
         .onAppear { startEmitting() }
-        .onDisappear { timer?.invalidate() }
+        .onDisappear { timer?.invalidate(); timer = nil }
     }
 
     private func startEmitting() {
+        guard timer == nil else { return }
         timer = Timer.scheduledTimer(withTimeInterval: 0.7, repeats: true) { _ in
             Task { @MainActor in
                 let n = NoteParticle(
@@ -265,78 +269,3 @@ private struct NoteParticles: View {
     }
 }
 
-// MARK: - Tears (sad / sob)
-
-private enum TearIntensity {
-    case light, heavy
-
-    var interval: TimeInterval {
-        switch self {
-        case .light: return 0.6
-        case .heavy: return 0.2
-        }
-    }
-
-    var count: Int {
-        switch self {
-        case .light: return 1
-        case .heavy: return 2
-        }
-    }
-}
-
-private struct TearDrop: Identifiable {
-    let id = UUID()
-    var x: CGFloat
-    var y: CGFloat
-    var opacity: Double
-}
-
-private struct TearDrops: View {
-    let size: CGFloat
-    let intensity: TearIntensity
-    @State private var tears: [TearDrop] = []
-    @State private var timer: Timer?
-
-    var body: some View {
-        ZStack {
-            ForEach(tears) { t in
-                Capsule()
-                    .fill(Color(red: 0.4, green: 0.6, blue: 1.0))
-                    .frame(width: 2, height: 5)
-                    .opacity(t.opacity)
-                    .position(x: size / 2 + t.x, y: size / 2 + t.y)
-            }
-        }
-        .frame(width: size, height: size)
-        .onAppear { startEmitting() }
-        .onDisappear { timer?.invalidate() }
-    }
-
-    private func startEmitting() {
-        timer = Timer.scheduledTimer(withTimeInterval: intensity.interval, repeats: true) { _ in
-            Task { @MainActor in
-                for _ in 0..<intensity.count {
-                    let t = TearDrop(
-                        x: CGFloat.random(in: -size * 0.15...size * 0.15),
-                        y: -size * 0.05,
-                        opacity: 0.8
-                    )
-                    tears.append(t)
-                    if let idx = tears.firstIndex(where: { $0.id == t.id }) {
-                        withAnimation(.easeIn(duration: 0.5)) {
-                            tears[idx].y += 25
-                            tears[idx].opacity = 0
-                        }
-                    }
-                    Task {
-                        try? await Task.sleep(for: .milliseconds(600))
-                        await MainActor.run {
-                            tears.removeAll { $0.id == t.id }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
