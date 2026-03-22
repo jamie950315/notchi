@@ -115,7 +115,7 @@ final class EmotionAnalyzer {
         guard let url = URL(string: endpoint),
               let scheme = url.scheme?.lowercased(),
               scheme == "https" || (scheme == "http" && (url.host == "localhost" || url.host == "127.0.0.1")) else {
-            logger.error("Invalid or insecure emotion API endpoint: \(endpoint, privacy: .public)")
+            logger.error("Invalid or insecure emotion API endpoint: \(endpoint, privacy: .private)")
             throw URLError(.badURL)
         }
 
@@ -158,7 +158,7 @@ final class EmotionAnalyzer {
             throw EmotionError.emptyResponse
         }
 
-        logger.debug("Emotion API raw response: \(text, privacy: .public)")
+        logger.debug("Emotion API raw response: \(text, privacy: .private)")
 
         let jsonString = Self.extractJSON(from: text)
         let emotionResponse = try JSONDecoder().decode(EmotionResponse.self, from: Data(jsonString.utf8))

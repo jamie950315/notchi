@@ -234,6 +234,7 @@ struct PanelSettingsView: View {
         let trimmedEndpoint = endpointInput.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmedEndpoint.isEmpty {
             UserDefaults.standard.removeObject(forKey: "emotionApiEndpoint")
+            endpointInput = AppSettings.emotionApiEndpoint
         } else {
             AppSettings.emotionApiEndpoint = trimmedEndpoint
         }
@@ -241,6 +242,7 @@ struct PanelSettingsView: View {
         let trimmedModel = modelInput.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmedModel.isEmpty {
             UserDefaults.standard.removeObject(forKey: "emotionModel")
+            modelInput = AppSettings.emotionModel
         } else {
             AppSettings.emotionModel = trimmedModel
         }
