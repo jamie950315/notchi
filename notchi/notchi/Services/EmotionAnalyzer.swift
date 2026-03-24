@@ -42,7 +42,14 @@ struct ClaudeSettingsConfig {
 
     static func buildMessagesURL(from baseURL: String) -> URL? {
         guard var components = URLComponents(string: baseURL) else {
-            logger.error("Invalid ANTHROPIC_BASE_URL: \(baseURL, privacy: .public)")
+            logger.error("Invalid ANTHROPIC_BASE_URL: \(baseURL, privacy: .private)")
+            return nil
+        }
+
+        let scheme = components.scheme?.lowercased() ?? ""
+        let host = components.host?.lowercased() ?? ""
+        guard scheme == "https" || (scheme == "http" && (host == "localhost" || host == "127.0.0.1")) else {
+            logger.error("Insecure ANTHROPIC_BASE_URL scheme rejected (must be https, or http for localhost)")
             return nil
         }
 
