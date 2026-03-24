@@ -3,35 +3,76 @@ import os.log
 
 private let logger = Logger(subsystem: "com.ruban.notchi", category: "EmotionAnalyzer")
 
-private struct ChatCompletionResponse: Decodable {
-    let choices: [Choice]
+private struct ClaudeSettingsFile: Decodable {
+    let env: [String: String]?
+}
 
-    struct Choice: Decodable {
-        let message: Message
+struct ClaudeSettingsConfig {
+    let apiURL: URL
+    let apiKey: String
+    let model: String
+
+    static let defaultBaseURL = "https://api.anthropic.com"
+    static let defaultAPIURL = URL(string: "\(defaultBaseURL)/v1/messages")!
+    static let defaultModel = "claude-haiku-4-5-20251001"
+
+    static func parse(from data: Data) throws -> ClaudeSettingsConfig? {
+        let settings = try JSONDecoder().decode(ClaudeSettingsFile.self, from: data)
+        let env = settings.env ?? [:]
+
+        let baseURL = env["ANTHROPIC_BASE_URL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedBaseURL = (baseURL?.isEmpty == false) ? baseURL! : defaultBaseURL
+
+        guard let authToken = env["ANTHROPIC_AUTH_TOKEN"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !authToken.isEmpty,
+              let apiURL = buildMessagesURL(from: resolvedBaseURL) else {
+            logger.debug("Claude settings present but missing valid auth token or base URL")
+            return nil
+        }
+
+        let model = env["ANTHROPIC_DEFAULT_HAIKU_MODEL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return ClaudeSettingsConfig(
+            apiURL: apiURL,
+            apiKey: authToken,
+            model: (model?.isEmpty == false) ? model! : defaultModel
+        )
     }
 
-    struct Message: Decodable {
-        let content: String?
+    static func buildMessagesURL(from baseURL: String) -> URL? {
+        guard var components = URLComponents(string: baseURL) else {
+            logger.error("Invalid ANTHROPIC_BASE_URL: \(baseURL, privacy: .public)")
+            return nil
+        }
+
+        let normalizedPath = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        switch true {
+        case normalizedPath.isEmpty:
+            components.path = "/v1/messages"
+        case normalizedPath.hasSuffix("/v1/messages") || normalizedPath == "v1/messages":
+            components.path = "/\(normalizedPath)"
+        case normalizedPath.hasSuffix("/v1") || normalizedPath == "v1":
+            components.path = "/\(normalizedPath)/messages"
+        default:
+            components.path = "/\(normalizedPath)/v1/messages"
+        }
+
+        return components.url
+    }
+}
+
+private struct HaikuResponse: Decodable {
+    let content: [ContentBlock]
+
+    struct ContentBlock: Decodable {
+        let text: String?
     }
 }
 
 private struct EmotionResponse: Decodable {
     let emotion: String
     let intensity: Double
-}
-
-enum EmotionError: LocalizedError {
-    case httpError(Int, String)
-    case decodeFailed(String)
-    case emptyResponse
-
-    var errorDescription: String? {
-        switch self {
-        case .httpError(let code, _): return "HTTP \(code)"
-        case .decodeFailed: return "Invalid response format"
-        case .emptyResponse: return "Empty response"
-        }
-    }
 }
 
 @MainActor
@@ -59,28 +100,26 @@ final class EmotionAnalyzer {
     func analyze(_ prompt: String) async -> (emotion: String, intensity: Double) {
         let start = ContinuousClock.now
 
-        guard let apiKey = AppSettings.anthropicApiKey, !apiKey.isEmpty else {
-            logger.info("No API key configured, skipping emotion analysis")
+        guard let config = resolveAPIConfig() else {
+            logger.info("No emotion analysis configuration available, using neutral fallback")
             return ("neutral", 0.0)
         }
 
         do {
-            let result = try await callChatCompletion(prompt: prompt, apiKey: apiKey)
+            let result = try await callHaiku(
+                prompt: prompt,
+                apiURL: config.apiURL,
+                apiKey: config.apiKey,
+                model: config.model
+            )
             let elapsed = ContinuousClock.now - start
             logger.info("Analysis took \(elapsed, privacy: .public)")
             return result
         } catch {
             let elapsed = ContinuousClock.now - start
-            logger.error("Emotion API failed (\(elapsed, privacy: .public)): \(error.localizedDescription)")
+            logger.error("Haiku API failed (\(elapsed, privacy: .public)): \(error.localizedDescription)")
             return ("neutral", 0.0)
         }
-    }
-
-    func test() async throws -> (emotion: String, intensity: Double) {
-        guard let apiKey = AppSettings.anthropicApiKey, !apiKey.isEmpty else {
-            throw URLError(.userAuthenticationRequired)
-        }
-        return try await callChatCompletion(prompt: "everything is broken again, I hate this, nothing ever works", apiKey: apiKey)
     }
 
     private static func extractJSON(from text: String) -> String {
@@ -108,27 +147,54 @@ final class EmotionAnalyzer {
         return cleaned
     }
 
-    private func callChatCompletion(prompt: String, apiKey: String) async throws -> (emotion: String, intensity: Double) {
-        let endpoint = AppSettings.emotionApiEndpoint
-        let model = AppSettings.emotionModel
-
-        guard let url = URL(string: endpoint),
-              let scheme = url.scheme?.lowercased(),
-              scheme == "https" || (scheme == "http" && (url.host == "localhost" || url.host == "127.0.0.1")) else {
-            logger.error("Invalid or insecure emotion API endpoint: \(endpoint, privacy: .private)")
-            throw URLError(.badURL)
+    private func resolveAPIConfig() -> (apiURL: URL, apiKey: String, model: String)? {
+        guard let apiKey = AppSettings.anthropicApiKey?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !apiKey.isEmpty else {
+            return loadClaudeSettingsConfig()
         }
 
-        var request = URLRequest(url: url)
+        return (
+            apiURL: ClaudeSettingsConfig.defaultAPIURL,
+            apiKey: apiKey,
+            model: ClaudeSettingsConfig.defaultModel
+        )
+    }
+
+    private func loadClaudeSettingsConfig() -> (apiURL: URL, apiKey: String, model: String)? {
+        let settingsURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/settings.json")
+
+        guard let data = try? Data(contentsOf: settingsURL) else {
+            return nil
+        }
+
+        do {
+            guard let config = try ClaudeSettingsConfig.parse(from: data) else {
+                return nil
+            }
+            return (
+                apiURL: config.apiURL,
+                apiKey: config.apiKey,
+                model: config.model
+            )
+        } catch {
+            logger.error("Failed to parse Claude settings.json: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    private func callHaiku(prompt: String, apiURL: URL, apiKey: String, model: String) async throws -> (emotion: String, intensity: Double) {
+        var request = URLRequest(url: apiURL)
         request.httpMethod = "POST"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
 
         let body: [String: Any] = [
             "model": model,
             "max_tokens": 50,
+            "system": Self.systemPrompt,
             "messages": [
-                ["role": "system", "content": Self.systemPrompt],
                 ["role": "user", "content": prompt]
             ]
         ]
@@ -141,24 +207,17 @@ final class EmotionAnalyzer {
         }
 
         guard httpResponse.statusCode == 200 else {
-            let body = String(data: data.prefix(200), encoding: .utf8) ?? "no body"
-            logger.warning("Emotion API returned HTTP \(httpResponse.statusCode): \(body, privacy: .private)")
-            throw EmotionError.httpError(httpResponse.statusCode, body)
+            logger.warning("Haiku API returned HTTP \(httpResponse.statusCode)")
+            throw URLError(.badServerResponse)
         }
 
-        let chatResponse: ChatCompletionResponse
-        do {
-            chatResponse = try JSONDecoder().decode(ChatCompletionResponse.self, from: data)
-        } catch {
-            logger.warning("Failed to decode emotion API response")
-            throw EmotionError.decodeFailed("decode error")
+        let haikuResponse = try JSONDecoder().decode(HaikuResponse.self, from: data)
+
+        guard let text = haikuResponse.content.first?.text else {
+            throw URLError(.cannotParseResponse)
         }
 
-        guard let text = chatResponse.choices.first?.message.content else {
-            throw EmotionError.emptyResponse
-        }
-
-        logger.debug("Emotion API raw response: \(text, privacy: .private)")
+        logger.debug("Haiku raw response: \(text, privacy: .public)")
 
         let jsonString = Self.extractJSON(from: text)
         let emotionResponse = try JSONDecoder().decode(EmotionResponse.self, from: Data(jsonString.utf8))

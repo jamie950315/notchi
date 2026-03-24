@@ -6,9 +6,6 @@ struct PanelSettingsView: View {
     @State private var hooksInstalled = HookInstaller.isInstalled()
     @State private var hooksError = false
     @State private var apiKeyInput = AppSettings.anthropicApiKey ?? ""
-    @State private var endpointInput = AppSettings.emotionApiEndpoint
-    @State private var modelInput = AppSettings.emotionModel
-    @State private var testState: EmotionTestState = .idle
     @State private var showingSpriteGallery = false
     @ObservedObject private var updateManager = UpdateManager.shared
     private var usageConnected: Bool { ClaudeUsageService.shared.isConnected }
@@ -118,134 +115,40 @@ struct PanelSettingsView: View {
                 )
             }
 
-            VStack(spacing: 6) {
-                settingsTextField(text: $endpointInput, placeholder: "API Endpoint")
-
-                HStack(spacing: 6) {
-                    settingsTextField(text: $modelInput, placeholder: "Model")
-
-                    SecureField("", text: $apiKeyInput)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundColor(TerminalColors.primaryText)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 5)
-                        .background(Color.white.opacity(0.06))
-                        .cornerRadius(6)
-                        .overlay(alignment: .leading) {
-                            if apiKeyInput.isEmpty {
-                                Text("API Key")
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .foregroundColor(TerminalColors.dimmedText)
-                                    .padding(.leading, 8)
-                                    .allowsHitTesting(false)
-                            }
-                        }
-                }
-                Button(action: testEmotionApi) {
-                    HStack(spacing: 4) {
-                        switch testState {
-                        case .idle:
-                            Image(systemName: "play.circle")
-                                .font(.system(size: 11))
-                            Text("Test")
-                                .font(.system(size: 11, weight: .medium))
-                        case .testing:
-                            ProgressView()
-                                .controlSize(.mini)
-                            Text("Testing...")
-                                .font(.system(size: 11, weight: .medium))
-                        case .success:
-                            Image(systemName: "checkmark.circle.fill")
-                                .font(.system(size: 11))
-                            Text("Connected")
-                                .font(.system(size: 11, weight: .medium))
-                        case .failure(let message):
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.system(size: 11))
-                            Text(message)
-                                .font(.system(size: 11, weight: .medium))
-                                .lineLimit(1)
+            HStack(spacing: 6) {
+                SecureField("", text: $apiKeyInput)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(TerminalColors.primaryText)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(Color.white.opacity(0.06))
+                    .cornerRadius(6)
+                    .onSubmit { saveApiKey() }
+                    .overlay(alignment: .leading) {
+                        if apiKeyInput.isEmpty {
+                            Text("Anthropic API Key")
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(TerminalColors.dimmedText)
+                                .padding(.leading, 8)
+                                .allowsHitTesting(false)
                         }
                     }
-                    .foregroundColor(testState.color)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(testState.color.opacity(0.12))
-                    .cornerRadius(6)
+
+                Button(action: saveApiKey) {
+                    Image(systemName: hasApiKey ? "checkmark.circle.fill" : "arrow.right.circle")
+                        .font(.system(size: 14))
+                        .foregroundColor(hasApiKey ? TerminalColors.green : TerminalColors.dimmedText)
                 }
                 .buttonStyle(.plain)
-                .disabled(testState == .testing || !hasApiKey)
             }
             .padding(.leading, 28)
-            .onChange(of: endpointInput) { saveEmotionSettings() }
-            .onChange(of: modelInput) { saveEmotionSettings() }
-            .onChange(of: apiKeyInput) { saveEmotionSettings() }
         }
     }
 
-    @State private var testTask: Task<Void, Never>?
-
-    private func testEmotionApi() {
-        testTask?.cancel()
-        testState = .testing
-        testTask = Task {
-            do {
-                _ = try await EmotionAnalyzer.shared.test()
-                guard !Task.isCancelled else { return }
-                testState = .success("")
-            } catch let error as URLError where error.code == .userAuthenticationRequired {
-                guard !Task.isCancelled else { return }
-                testState = .failure("No API key")
-            } catch {
-                guard !Task.isCancelled else { return }
-                testState = .failure(error.localizedDescription)
-            }
-            try? await Task.sleep(for: .seconds(4))
-            guard !Task.isCancelled else { return }
-            testState = .idle
-        }
-    }
-
-    private func settingsTextField(text: Binding<String>, placeholder: String) -> some View {
-        TextField("", text: text)
-            .textFieldStyle(.plain)
-            .font(.system(size: 11, design: .monospaced))
-            .foregroundColor(TerminalColors.primaryText)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .background(Color.white.opacity(0.06))
-            .cornerRadius(6)
-            .overlay(alignment: .leading) {
-                if text.wrappedValue.isEmpty {
-                    Text(placeholder)
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundColor(TerminalColors.dimmedText)
-                        .padding(.leading, 8)
-                        .allowsHitTesting(false)
-                }
-            }
-    }
-
-    private func saveEmotionSettings() {
-        let trimmedKey = apiKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        AppSettings.anthropicApiKey = trimmedKey.isEmpty ? nil : trimmedKey
-
-        let trimmedEndpoint = endpointInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmedEndpoint.isEmpty {
-            UserDefaults.standard.removeObject(forKey: "emotionApiEndpoint")
-            endpointInput = AppSettings.emotionApiEndpoint
-        } else {
-            AppSettings.emotionApiEndpoint = trimmedEndpoint
-        }
-
-        let trimmedModel = modelInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmedModel.isEmpty {
-            UserDefaults.standard.removeObject(forKey: "emotionModel")
-            modelInput = AppSettings.emotionModel
-        } else {
-            AppSettings.emotionModel = trimmedModel
-        }
+    private func saveApiKey() {
+        let trimmed = apiKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        AppSettings.anthropicApiKey = trimmed.isEmpty ? nil : trimmed
     }
 
     private var actionsSection: some View {
@@ -259,7 +162,7 @@ struct PanelSettingsView: View {
             }
             .buttonStyle(.plain)
 
-            Button(action: { updateManager.checkForUpdates() }) {
+            Button(action: handleUpdatesAction) {
                 SettingsRowView(icon: "arrow.triangle.2.circlepath", title: "Check for Updates") {
                     updateStatusView
                 }
@@ -279,6 +182,10 @@ struct PanelSettingsView: View {
 
     private func openGitHubRepo() {
         NSWorkspace.shared.open(URL(string: "https://github.com/sk-ruban/notchi")!)
+    }
+
+    private func openLatestReleasePage() {
+        NSWorkspace.shared.open(URL(string: "https://github.com/sk-ruban/notchi/releases/latest")!)
     }
 
     private var quitSection: some View {
@@ -318,6 +225,14 @@ struct PanelSettingsView: View {
 
     private func connectUsage() {
         ClaudeUsageService.shared.connectAndStartPolling()
+    }
+
+    private func handleUpdatesAction() {
+        if case .upToDate = updateManager.state {
+            openLatestReleasePage()
+        } else {
+            updateManager.checkForUpdates()
+        }
     }
 
     private func installHooksIfNeeded() {
@@ -416,22 +331,6 @@ struct ToggleSwitch: View {
                 .padding(2)
         }
         .animation(.easeInOut(duration: 0.15), value: isOn)
-    }
-}
-
-private enum EmotionTestState: Equatable {
-    case idle
-    case testing
-    case success(String)
-    case failure(String)
-
-    var color: Color {
-        switch self {
-        case .idle: return TerminalColors.dimmedText
-        case .testing: return TerminalColors.dimmedText
-        case .success: return TerminalColors.green
-        case .failure: return TerminalColors.red
-        }
     }
 }
 

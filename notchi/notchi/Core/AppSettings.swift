@@ -5,8 +5,6 @@ struct AppSettings {
     private static let isMutedKey = "isMuted"
     private static let previousSoundKey = "previousNotificationSound"
     private static let isUsageEnabledKey = "isUsageEnabled"
-    private static let emotionApiEndpointKey = "emotionApiEndpoint"
-    private static let emotionModelKey = "emotionModel"
     private static let claudeUsageRecoverySnapshotKey = "claudeUsageRecoverySnapshot"
 
     static var isUsageEnabled: Bool {
@@ -33,16 +31,6 @@ struct AppSettings {
     static var anthropicApiKey: String? {
         get { KeychainManager.getAnthropicApiKey() }
         set { KeychainManager.setAnthropicApiKey(newValue) }
-    }
-
-    static var emotionApiEndpoint: String {
-        get { UserDefaults.standard.string(forKey: emotionApiEndpointKey) ?? "https://api.openai.com/v1/chat/completions" }
-        set { UserDefaults.standard.set(newValue, forKey: emotionApiEndpointKey) }
-    }
-
-    static var emotionModel: String {
-        get { UserDefaults.standard.string(forKey: emotionModelKey) ?? "gpt-4o-mini" }
-        set { UserDefaults.standard.set(newValue, forKey: emotionModelKey) }
     }
 
     static var notificationSound: NotificationSound {
