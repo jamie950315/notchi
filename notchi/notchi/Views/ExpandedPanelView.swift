@@ -71,17 +71,18 @@ struct ExpandedPanelView: View {
                     }
                 }
 
-                PanelSettingsView()
-                    .frame(width: geometry.size.width)
-                    .offset(x: showingSettings ? 0 : geometry.size.width)
-                    .opacity(showingSettings ? 1 : 0)
+                if showingSettings {
+                    PanelSettingsView()
+                        .frame(width: geometry.size.width)
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
+                }
             }
         }
         .animation(.easeInOut(duration: 0.25), value: showingSettings)
         .animation(.easeInOut(duration: 0.25), value: shouldShowSessionPicker)
         .onChange(of: showingSettings) { _, isShowing in
             if !isShowing {
-                UpdateManager.shared.clearInlineNoUpdateStatus()
+                UpdateManager.shared.clearTransientStatus()
             }
         }
     }

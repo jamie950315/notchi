@@ -6,18 +6,24 @@ private let logger = Logger(subsystem: "com.ruban.notchi", category: "SocketServ
 typealias HookEventHandler = @Sendable (HookEvent) -> Void
 
 final class SocketServer {
-    static let shared = SocketServer()
     static let socketPath = "/tmp/notchi.sock"
+    static let shared = SocketServer(socketPath: socketPath, clientReadTimeout: 0.5)
 
+    private let socketPath: String
+    private let clientReadTimeout: TimeInterval
     private var serverSocket: Int32 = -1
     private var acceptSource: DispatchSourceRead?
     private var eventHandler: HookEventHandler?
-    private let queue = DispatchQueue(label: "com.ruban.notchi.socket", qos: .userInitiated)
+    private let serverQueue = DispatchQueue(label: "com.ruban.notchi.socket.server", qos: .userInitiated)
+    private let clientQueue = DispatchQueue(label: "com.ruban.notchi.socket.client", qos: .userInitiated, attributes: .concurrent)
 
-    private init() {}
+    init(socketPath: String = SocketServer.socketPath, clientReadTimeout: TimeInterval = 0.5) {
+        self.socketPath = socketPath
+        self.clientReadTimeout = clientReadTimeout
+    }
 
     func start(onEvent: @escaping HookEventHandler) {
-        queue.async { [weak self] in
+        serverQueue.async { [weak self] in
             self?.startServer(onEvent: onEvent)
         }
     }
@@ -25,9 +31,18 @@ final class SocketServer {
     private func startServer(onEvent: @escaping HookEventHandler) {
         guard serverSocket < 0 else { return }
 
-        eventHandler = onEvent
+        switch prepareSocketPathForBinding() {
+        case .ready:
+            break
+        case .alreadyActive:
+            logger.warning("Socket listener already active at \(self.socketPath, privacy: .public); skipping duplicate startup")
+            return
+        case .failed(let errorCode):
+            logger.error("Failed to prepare socket path: \(errorCode)")
+            return
+        }
 
-        unlink(Self.socketPath)
+        eventHandler = onEvent
 
         serverSocket = socket(AF_UNIX, SOCK_STREAM, 0)
         guard serverSocket >= 0 else {
@@ -40,7 +55,7 @@ final class SocketServer {
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
-        Self.socketPath.withCString { ptr in
+        socketPath.withCString { ptr in
             withUnsafeMutablePointer(to: &addr.sun_path) { pathPtr in
                 let pathBufferPtr = UnsafeMutableRawPointer(pathPtr)
                     .assumingMemoryBound(to: CChar.self)
@@ -61,7 +76,7 @@ final class SocketServer {
             return
         }
 
-        chmod(Self.socketPath, 0o777)
+        chmod(socketPath, 0o777)
 
         guard listen(serverSocket, 10) == 0 else {
             logger.error("Failed to listen: \(errno)")
@@ -70,11 +85,11 @@ final class SocketServer {
             return
         }
 
-        logger.info("Listening on \(Self.socketPath, privacy: .public)")
+        logger.info("Listening on \(self.socketPath, privacy: .public)")
 
-        acceptSource = DispatchSource.makeReadSource(fileDescriptor: serverSocket, queue: queue)
+        acceptSource = DispatchSource.makeReadSource(fileDescriptor: serverSocket, queue: serverQueue)
         acceptSource?.setEventHandler { [weak self] in
-            self?.acceptConnection()
+            self?.acceptConnections()
         }
         acceptSource?.setCancelHandler { [weak self] in
             if let fd = self?.serverSocket, fd >= 0 {
@@ -86,37 +101,121 @@ final class SocketServer {
     }
 
     func stop() {
-        acceptSource?.cancel()
-        acceptSource = nil
-        unlink(Self.socketPath)
+        serverQueue.async { [weak self] in
+            self?.stopServer()
+        }
     }
 
-    private func acceptConnection() {
-        let clientSocket = accept(serverSocket, nil, nil)
-        guard clientSocket >= 0 else { return }
+    private func prepareSocketPathForBinding() -> SocketPathPreparation {
+        guard FileManager.default.fileExists(atPath: socketPath) else {
+            return .ready
+        }
 
-        var nosigpipe: Int32 = 1
-        setsockopt(clientSocket, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, socklen_t(MemoryLayout<Int32>.size))
-
-        handleClient(clientSocket)
+        switch existingSocketState(at: socketPath) {
+        case .activeListener:
+            return .alreadyActive
+        case .stale, .missing:
+            let unlinkResult = unlink(socketPath)
+            if unlinkResult == 0 || errno == ENOENT {
+                return .ready
+            }
+            return .failed(errno)
+        case .failed(let errorCode):
+            return .failed(errorCode)
+        }
     }
 
-    private func handleClient(_ clientSocket: Int32) {
-        defer { close(clientSocket) }
+    private func existingSocketState(at path: String) -> ExistingSocketState {
+        let probeSocket = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard probeSocket >= 0 else {
+            return .failed(errno)
+        }
+        defer { close(probeSocket) }
 
-        var allData = Data()
-        var buffer = [UInt8](repeating: 0, count: 4096)
-
-        while true {
-            let bytesRead = read(clientSocket, &buffer, buffer.count)
-            if bytesRead > 0 {
-                allData.append(contentsOf: buffer[0..<bytesRead])
-            } else {
-                break
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        path.withCString { ptr in
+            withUnsafeMutablePointer(to: &addr.sun_path) { pathPtr in
+                let pathBufferPtr = UnsafeMutableRawPointer(pathPtr)
+                    .assumingMemoryBound(to: CChar.self)
+                strcpy(pathBufferPtr, ptr)
             }
         }
 
-        guard !allData.isEmpty else { return }
+        let connectResult = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+                connect(probeSocket, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+
+        if connectResult == 0 {
+            return .activeListener
+        }
+
+        switch errno {
+        case ENOENT:
+            return .missing
+        case ECONNREFUSED:
+            return .stale
+        default:
+            return .failed(errno)
+        }
+    }
+
+    private func stopServer() {
+        if let acceptSource {
+            acceptSource.cancel()
+            self.acceptSource = nil
+        } else if serverSocket >= 0 {
+            close(serverSocket)
+            serverSocket = -1
+        }
+
+        unlink(socketPath)
+    }
+
+    private func acceptConnections() {
+        while true {
+            let clientSocket = accept(serverSocket, nil, nil)
+            guard clientSocket >= 0 else {
+                let acceptError = errno
+
+                if acceptError == EINTR {
+                    continue
+                }
+
+                if acceptError == EAGAIN || acceptError == EWOULDBLOCK {
+                    return
+                }
+
+                logger.error("Failed to accept connection: \(acceptError)")
+                return
+            }
+
+            configureClientSocket(clientSocket)
+            let eventHandler = self.eventHandler
+            clientQueue.async { [weak self] in
+                guard let self else {
+                    close(clientSocket)
+                    return
+                }
+
+                self.handleClient(clientSocket, eventHandler: eventHandler)
+            }
+        }
+    }
+
+    private func configureClientSocket(_ clientSocket: Int32) {
+        let clientFlags = fcntl(clientSocket, F_GETFL)
+        if clientFlags >= 0, fcntl(clientSocket, F_SETFL, clientFlags & ~O_NONBLOCK) != 0 {
+            logger.warning("Failed to clear O_NONBLOCK on client socket: \(errno)")
+        }
+    }
+
+    private func handleClient(_ clientSocket: Int32, eventHandler: HookEventHandler?) {
+        defer { close(clientSocket) }
+
+        guard let allData = readClientPayload(from: clientSocket), !allData.isEmpty else { return }
 
         guard let event = try? JSONDecoder().decode(HookEvent.self, from: allData) else {
             logger.warning("Failed to parse event")
@@ -125,6 +224,81 @@ final class SocketServer {
 
         logEvent(event)
         eventHandler?(event)
+    }
+
+    private func readClientPayload(from clientSocket: Int32) -> Data? {
+        var allData = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        let timeoutMilliseconds = Self.timeoutMilliseconds(for: clientReadTimeout)
+
+        while true {
+            switch waitForReadableClientSocket(clientSocket, timeoutMilliseconds: timeoutMilliseconds) {
+            case .ready:
+                break
+            case .timedOut:
+                logger.warning("Dropped idle client connection after read timeout")
+                return nil
+            case .failed(let errorCode):
+                logger.warning("Failed waiting for client socket readability: \(errorCode)")
+                return nil
+            }
+
+            let bytesRead = read(clientSocket, &buffer, buffer.count)
+
+            if bytesRead > 0 {
+                allData.append(contentsOf: buffer[0..<bytesRead])
+                continue
+            }
+
+            if bytesRead == 0 {
+                return allData
+            }
+
+            let readError = errno
+            if readError == EINTR {
+                continue
+            }
+
+            logger.warning("Failed to read client socket: \(readError)")
+            return nil
+        }
+    }
+
+    private func waitForReadableClientSocket(_ clientSocket: Int32, timeoutMilliseconds: Int32) -> SocketReadiness {
+        var descriptor = pollfd(fd: clientSocket, events: Int16(POLLIN), revents: 0)
+
+        while true {
+            let pollResult = poll(&descriptor, 1, timeoutMilliseconds)
+
+            if pollResult > 0 {
+                if descriptor.revents & Int16(POLLNVAL) != 0 {
+                    return .failed(EBADF)
+                }
+
+                if descriptor.revents & Int16(POLLERR) != 0 {
+                    return .failed(EIO)
+                }
+
+                return .ready
+            }
+
+            if pollResult == 0 {
+                return .timedOut
+            }
+
+            let pollError = errno
+            if pollError == EINTR {
+                continue
+            }
+
+            return .failed(pollError)
+        }
+    }
+
+    private static func timeoutMilliseconds(for timeout: TimeInterval) -> Int32 {
+        let clampedTimeout = max(timeout, 0)
+        let milliseconds = Int((clampedTimeout * 1000).rounded(.up))
+        return Int32(min(milliseconds, Int(Int32.max)))
     }
 
     private func logEvent(_ event: HookEvent) {
@@ -146,4 +320,23 @@ final class SocketServer {
             break
         }
     }
+}
+
+private enum SocketReadiness {
+    case ready
+    case timedOut
+    case failed(Int32)
+}
+
+private enum SocketPathPreparation {
+    case ready
+    case alreadyActive
+    case failed(Int32)
+}
+
+private enum ExistingSocketState {
+    case activeListener
+    case stale
+    case missing
+    case failed(Int32)
 }
